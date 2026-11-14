@@ -1,0 +1,104 @@
+#!/bin/sh
+#
+# postinstall -- runs as root at the end of the .pkg install.
+#
+# Picks whichever kext backend is available, preferring Turbo Boost Switcher's
+# (covered by an existing per-machine allowance, so it loads on a stock system).
+# Nothing is downloaded: if TBS is absent we say where to get it and fall back
+# to our own kext.
+#
+set -u
+
+PREFIX=/usr/local/libexec/turbodisable
+VAR_DIR=/usr/local/var/turbodisable
+LABEL=com.turbodisable.turbod
+PLIST=/Library/LaunchDaemons/$LABEL.plist
+KEXT=/Library/Extensions/TurboLock.kext
+KEXT_ID=com.turbodisable.TurboLock
+TBS_ID=com.rugarciap.DisableTurboBoost
+TBS_URL=https://www.rugarciap.com/
+
+tbs_kext() {
+    for p in \
+        "/Applications/tbswitcher_resources/DisableTurboBoost.64bits.kext" \
+        "/Library/StagedExtensions/Applications/tbswitcher_resources/DisableTurboBoost.64bits.kext" \
+        "/Library/Extensions/DisableTurboBoost.64bits.kext"
+    do
+        [ -d "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+loaded() { kmutil showloaded --list-only --bundle-identifier "$1" 2>/dev/null | grep -q "$1"; }
+
+# Ownership is validated by the kernel before anything else.
+if [ -d "$KEXT" ]; then
+    chown -R root:wheel "$KEXT" 2>/dev/null || true
+    chmod 0755 "$KEXT" "$KEXT/Contents" "$KEXT/Contents/MacOS" 2>/dev/null || true
+    chmod 0644 "$KEXT/Contents/Info.plist" 2>/dev/null || true
+    chmod 0755 "$KEXT/Contents/MacOS/TurboLock" 2>/dev/null || true
+    xattr -cr "$KEXT" 2>/dev/null || true
+fi
+
+mkdir -p "$VAR_DIR"
+[ -f "$VAR_DIR/state" ] || echo off > "$VAR_DIR/state"
+chown root:wheel "$VAR_DIR/state" 2>/dev/null || true
+: >> "$VAR_DIR/turbod.log" 2>/dev/null || true
+
+launchctl bootout system/"$LABEL" 2>/dev/null || true
+launchctl enable  system/"$LABEL" 2>/dev/null || true
+launchctl bootstrap system "$PLIST" 2>/dev/null \
+    || launchctl load -w "$PLIST" 2>/dev/null || true
+
+sleep 1
+
+# --------------------------------------------------------------- backend --
+TBS_PATH=$(tbs_kext 2>/dev/null || true)
+
+if [ -n "$TBS_PATH" ]; then
+    OUT=$(kextload -v "$TBS_PATH" 2>&1) || true
+    if loaded "$TBS_ID"; then
+        echo "Turbo Boost Switcher kext loaded. Turbo Boost is disabled."
+        echo
+        echo "No approval step was needed: that bundle already has one."
+        echo "Toggle any time with:  turboctl off | on | status"
+        exit 0
+    fi
+    echo "Found the TBS kext but it would not load:"
+    echo "$OUT" | sed 's/^/    /'
+    echo
+    echo "Reinstall Turbo Boost Switcher and re-run:"
+    echo "    sudo /usr/local/libexec/turbodisable/turbod --apply-saved"
+    echo
+    echo "Falling back to our own kext."
+fi
+
+OUT=$(kextload -v "$KEXT" 2>&1) || true
+
+if loaded "$KEXT_ID"; then
+    echo "TurboLock.kext loaded. Turbo Boost is disabled."
+    echo
+    echo "Toggle any time with:  turboctl off | on | status"
+    exit 0
+fi
+
+cat >&2 <<MSG
+--------------------------------------------------------------------------
+No kext backend could be loaded, so Turbo Boost is unchanged. Nothing else
+was modified; the daemon is running and will retry on its own.
+
+Two ways forward:
+
+  1. Install Turbo Boost Switcher -- its kext needs no approval step:
+         $TBS_URL
+     then run:  sudo /usr/local/libexec/turbodisable/turbod --apply-saved
+
+  2. Approve our own kext once, with one boot into Recovery:
+         csrutil enable --without kext
+     then restart and run:
+         sudo /usr/local/libexec/turbodisable/turbod --apply-saved
+--------------------------------------------------------------------------
+kernel said:
+MSG
+echo "$OUT" | sed 's/^/    /' >&2
+exit 0

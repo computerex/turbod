@@ -1,0 +1,15 @@
+# build artifacts
+.build/
+dist/
+turbod
+clocktest
+kext/TurboLock.kext/
+
+# agent / harness scratch -- never publish
+.harness_output/
+.sessions/
+.claude/
+
+# macOS
+.DS_Store
+._*

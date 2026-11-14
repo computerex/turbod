@@ -1,0 +1,87 @@
+name: build
+
+# Produces downloadable artifacts on every push/tag. No Apple Developer
+# account, no notarization, no secrets: the kext is built from source and is
+# approved by each user once, locally (see README).
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Intel runner: the kext is x86_64-only, and Turbo Boost only exists there.
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check toolchain
+        run: |
+          xcode-select -p
+          clang --version
+          test -d "$(xcrun --show-sdk-path)/System/Library/Frameworks/Kernel.framework"
+
+      - name: Build everything
+        run: make all
+
+      - name: Sandbox self-test (no root, no kext writes)
+        run: make check
+
+      - name: Version from tag
+        id: v
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .pkg installer
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: make package
+
+      - name: Source tarball (for `build it yourself` users)
+        run: |
+          NAME="turbodisable-${{ steps.v.outputs.version }}"
+          git archive --format=tar.gz --prefix="$NAME/" -o "dist/$NAME-src.tar.gz" HEAD
+
+      - name: Checksums
+        run: |
+          cd dist
+          shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turbodisable-${{ steps.v.outputs.version }}
+          path: dist/*
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Turbo Boost on/off for Intel Macs.
+
+            **From source**
+
+                git clone ${{ github.server_url }}/${{ github.repository }}
+                cd turbod
+                sudo ./install.sh
+
+            No Recovery boot and no `csrutil` change are needed. `install.sh`
+            fetches Turbo Boost Switcher (freeware) when it is not already
+            present, verifies it is Rugarciap's notarized Developer ID build,
+            and loads its kernel extension. After that, `turboctl off` and
+            `turboctl on` toggle Turbo Boost with no password prompt.
+
+            **Prebuilt installer**
+
+                sudo installer -pkg turbodisable-${{ steps.v.outputs.version }}.pkg -target /
+
+            Verify the download with `SHA256SUMS.txt`.

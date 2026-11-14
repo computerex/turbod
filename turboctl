@@ -1,0 +1,242 @@
+#!/bin/sh
+#
+# turboctl -- turn Intel Turbo Boost off/on without password prompts
+#
+#   turboctl off        disable Turbo Boost
+#   turboctl on         re-enable Turbo Boost
+#   turboctl toggle     flip it
+#   turboctl status     current state + measured clock
+#   turboctl doctor     diagnostics, for bug reports
+#   turboctl bench      just measure the effective clock
+#   turboctl log [n]    tail the daemon log
+#   turboctl install    build + install (add --recovery for the one-time step)
+#   turboctl uninstall  remove everything, re-enable Turbo Boost
+#
+set -u
+
+PREFIX=${TURBOD_PREFIX:-/usr/local/libexec/turbodisable}
+SOCK=${TURBOD_SOCK:-/var/run/turbodisable.sock}
+STATE=${TURBOD_STATE:-/usr/local/var/turbodisable/state}
+LOG=${TURBOD_LOG:-/usr/local/var/turbodisable/turbod.log}
+KEXT_ID=com.turbodisable.TurboLock
+KEXT_PATH=/Library/Extensions/TurboLock.kext
+TBS_ID=com.rugarciap.DisableTurboBoost
+TBS_PATHS="/Applications/tbswitcher_resources/DisableTurboBoost.64bits.kext
+/Library/StagedExtensions/Applications/tbswitcher_resources/DisableTurboBoost.64bits.kext
+/Library/Extensions/DisableTurboBoost.64bits.kext"
+STASH=/private/var/db/KernelExtensionManagement/AuxKC/CurrentAuxKC/StashedExtensions
+LABEL=com.turbodisable.turbod
+
+SELFDIR=$(cd "$(dirname "$0")" && pwd)
+TOOLDIR=$PREFIX
+[ -x "$PREFIX/turbod" ] || TOOLDIR=$SELFDIR
+
+die() { echo "turboctl: $*" >&2; exit 1; }
+
+base_ghz() {
+    b=$(sysctl -n machdep.cpu.brand_string 2>/dev/null \
+        | sed -n 's/.*@ *\([0-9][0-9]*\.[0-9]*\) *GHz.*/\1/p')
+    [ -n "${b:-}" ] || b=2.30
+    echo "$b"
+}
+
+kext_id_loaded() {   # $1 = bundle identifier
+    kmutil showloaded --list-only --bundle-identifier "$1" 2>/dev/null | grep -q "$1"
+}
+
+kext_state() {   # "loaded" or "unloaded"; either backend counts
+    if kext_id_loaded "$TBS_ID" || kext_id_loaded "$KEXT_ID"; then
+        echo loaded
+    else
+        echo unloaded
+    fi
+}
+
+kext_on_disk() {
+    [ -d "$KEXT_PATH" ] && return 0
+    [ -d "$PREFIX/kext/TurboLock.kext" ] && return 0
+    for p in $TBS_PATHS; do [ -d "$p" ] && return 0; done
+    return 1
+}
+
+kext_stashed() {
+    [ -d "$STASH" ] || return 1
+    for d in "$STASH"/*/; do
+        for p in "$d"*/Contents/Info.plist "$d"Contents/Info.plist; do
+            [ -f "$p" ] || continue
+            id=$(plutil -extract CFBundleIdentifier raw "$p" 2>/dev/null)
+            if [ "$id" = "$KEXT_ID" ] || [ "$id" = "$TBS_ID" ]; then return 0; fi
+        done
+    done
+    return 1
+}
+
+signing_state() {
+    _s=$(csrutil status 2>/dev/null) || { echo unknown; return; }
+    case "$_s" in
+        *"Kext Signing: disabled"*)                      echo "relaxed" ;;
+        "System Integrity Protection status: disabled"*) echo "SIP off" ;;
+        *)                                               echo "enforced" ;;
+    esac
+}
+
+bench() {        # $1 = iterations; prints effective GHz
+    n=${1:-1500000000}
+    [ -x "$TOOLDIR/clocktest" ] || return 1
+    "$TOOLDIR/clocktest" "$n" 2>/dev/null \
+        | sed -n 's/.*effective_GHz=\([0-9][0-9]*\.[0-9]*\).*/\1/p'
+}
+
+verdict() {      # $1 = measured GHz -> DISABLED / ENABLED / UNKNOWN
+    base=$(base_ghz)
+    awk -v g="${1:-0}" -v b="$base" 'BEGIN {
+        if (g <= 0)            print "UNKNOWN";
+        else if (g < b * 1.06) print "DISABLED";
+        else                   print "ENABLED";
+    }'
+}
+
+daemon_up() {
+    [ -S "$SOCK" ] || return 1
+    r=$(printf 'ping\n' | nc -U -w 2 "$SOCK" 2>/dev/null)
+    [ "${r:-}" = "ok pong" ]
+}
+
+send_cmd() {
+    printf '%s\n' "$1" | nc -U -w 10 "$SOCK" 2>/dev/null
+}
+
+cmd_status() {
+    base=$(base_ghz)
+    ks=$(kext_state)
+
+    echo "CPU             : $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+    echo "kext            : $ks ($KEXT_ID)"
+    if daemon_up; then
+        echo "daemon          : running (no password needed to toggle)"
+    elif [ -S "$SOCK" ]; then
+        echo "daemon          : NOT responding (socket present)"
+    else
+        echo "daemon          : not running"
+    fi
+    echo "stored state    : $(cat "$STATE" 2>/dev/null || echo 'off (default)')"
+
+    v=ENABLED
+    [ "$ks" = loaded ] && v=DISABLED
+
+    if [ -x "$TOOLDIR/clocktest" ]; then
+        g=$(bench 1500000000)
+        if [ -n "${g:-}" ]; then
+            m=$(verdict "$g")
+            echo "measured clock  : ${g} GHz (base ${base} GHz) -> $m"
+            # The measurement is ground truth; the kext flag is only intent.
+            if [ "$m" != "UNKNOWN" ]; then
+                if [ "$m" != "$v" ]; then
+                    echo "NOTE            : kext says $v but the CPU measures $m"
+                fi
+                v=$m
+            fi
+        fi
+    fi
+    echo "Turbo Boost     : $v"
+}
+
+cmd_doctor() {
+    ks=$(kext_state)
+    if daemon_up; then dstate=running; else dstate="not running"; fi
+    if kext_on_disk; then kon=yes; else kon=NO; fi
+    if kext_stashed; then kst="yes (approval is permanent)"; else kst="not seen"; fi
+    signed=$(signing_state)
+    stored=$(cat "$STATE" 2>/dev/null || echo "unset (defaults to off)")
+
+    echo "turboctl doctor"
+    echo "---------------"
+    printf '%-14s %s\n' macOS          "$(sw_vers -productVersion 2>/dev/null)"
+    printf '%-14s %s\n' arch           "$(uname -m)"
+    printf '%-14s %s\n' CPU            "$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+    printf '%-14s %s\n' "kext on disk" "$kon"
+    printf '%-14s %s\n' "kext loaded"  "$ks"
+    printf '%-14s %s\n' "kext stashed" "$kst"
+    printf '%-14s %s\n' "kext signing" "$signed"
+    printf '%-14s %s\n' daemon         "$dstate"
+    printf '%-14s %s\n' "stored state" "$stored"
+
+    g=$(bench 1500000000)
+    [ -n "${g:-}" ] && printf '%-14s %s\n' measured "${g} GHz -> $(verdict "$g")"
+    echo
+
+    case "$ks:$dstate" in
+        unloaded:*)
+            if [ "$signed" = "enforced" ]; then
+                echo "next step: sudo $SELFDIR/install.sh --recovery"
+                echo "           (one-time kext approval; costs nothing)"
+            else
+                echo "next step: sudo $SELFDIR/install.sh"
+            fi ;;
+        *:"not running")
+            echo "next step: sudo $SELFDIR/install.sh" ;;
+        *)
+            if [ "$signed" = "relaxed" ] && kext_stashed; then
+                echo "next step: approval is permanent -- you can restore full SIP"
+                echo "           (Recovery > Terminal: csrutil enable)"
+            else
+                echo "next step: nothing to do."
+            fi ;;
+    esac
+}
+
+cmd_toggle() {
+    want=$1
+    if ! kext_on_disk; then
+        die "no kext backend found (install Turbo Boost Switcher, or run: sudo ./install.sh)"
+    fi
+    if daemon_up; then
+        r=$(send_cmd "$want")
+        case "${r:-}" in
+            "ok "*)  echo "Turbo Boost: $want applied by daemon"; return 0 ;;
+            "")      echo "daemon did not answer; falling back to sudo" >&2 ;;
+            *)       echo "daemon: $r" >&2; return 1 ;;
+        esac
+    fi
+    [ -x "$TOOLDIR/turbod" ] || die "turbod not found in $TOOLDIR (run ./install.sh)"
+    exec sudo "$TOOLDIR/turbod" --once "$want"
+}
+
+cmd_toggle_auto() {
+    if [ "$(kext_state)" = loaded ]; then
+        cmd_toggle on
+    else
+        cmd_toggle off
+    fi
+}
+
+case "${1:-status}" in
+    on|enable)    cmd_toggle on ;;
+    off|disable)  cmd_toggle off ;;
+    toggle)       cmd_toggle_auto ;;
+    status|"")    cmd_status ;;
+    doctor)       cmd_doctor ;;
+    bench|verify)
+        g=$(bench "${2:-3000000000}")
+        [ -n "${g:-}" ] || die "benchmark failed (clocktest missing?)"
+        echo "measured ${g} GHz (base $(base_ghz) GHz) -> $(verdict "$g")" ;;
+    log)          exec tail -n "${2:-40}" "$LOG" ;;
+    install)      exec sudo "$SELFDIR/install.sh" "${2:-}" ;;
+    uninstall)    exec sudo "$SELFDIR/uninstall.sh" ;;
+    -h|--help|help)
+        cat <<'USAGE'
+turboctl -- switch Intel Turbo Boost on/off without password prompts
+
+  turboctl off           disable Turbo Boost
+  turboctl on            re-enable Turbo Boost
+  turboctl toggle        flip the current state
+  turboctl status        state + measured clock
+  turboctl doctor        diagnostics, for bug reports
+  turboctl bench         just measure the effective clock
+  turboctl log [n]       tail the daemon log
+  turboctl install       build+install; add --recovery for the one-time approval
+  turboctl uninstall     remove everything, re-enable Turbo Boost
+USAGE
+        ;;
+    *)            die "unknown command '$1' (try: turboctl help)" ;;
+esac
