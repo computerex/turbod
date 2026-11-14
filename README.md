@@ -161,7 +161,6 @@ back to our own kext. For the automatic fetch, use `install.sh`.
 | `install.sh` / `uninstall.sh` | setup / teardown |
 | `packaging/` | `.pkg` builder and postinstall |
 | `test-sandbox.sh` | end-to-end daemon test, no root (`make check`) |
-| `test-e2e.sh` | full install test incl. the TBS download (root, reversible) |
 
 ## Caveats
 
