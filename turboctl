@@ -52,6 +52,14 @@ kext_state() {   # "loaded" or "unloaded"; either backend counts
     fi
 }
 
+# Which id is actually resident -- the two backends have different ids and
+# reporting the wrong one is worse than reporting none.
+kext_active_id() {
+    if kext_id_loaded "$TBS_ID"; then echo "$TBS_ID"
+    elif kext_id_loaded "$KEXT_ID"; then echo "$KEXT_ID"
+    else echo none; fi
+}
+
 kext_on_disk() {
     [ -d "$KEXT_PATH" ] && return 0
     [ -d "$PREFIX/kext/TurboLock.kext" ] && return 0
@@ -109,9 +117,10 @@ send_cmd() {
 cmd_status() {
     base=$(base_ghz)
     ks=$(kext_state)
+    kid=$(kext_active_id)
 
     echo "CPU             : $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
-    echo "kext            : $ks ($KEXT_ID)"
+    echo "kext            : $ks ($kid)"
     if daemon_up; then
         echo "daemon          : running (no password needed to toggle)"
     elif [ -S "$SOCK" ]; then
